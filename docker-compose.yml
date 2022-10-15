@@ -1,0 +1,7 @@
+version: "3"
+services:
+  p4c:
+    image: p4lang/p4c:latest
+    volumes:
+      - ./examples:/p4c
+      - ./p4include:/usr/local/share/p4c/p4include

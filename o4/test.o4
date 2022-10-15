@@ -1,0 +1,24 @@
+#lang o4
+
+header header_t {
+    bit<32>[4] values;
+}
+
+struct headers {
+    header_t test_header;
+}
+
+control test_control(inout headers hdr) {
+    factory test_factory (int index, bit<32> value) {
+        action test_action () {
+            hdr.test_header.values[index] = value;
+        }
+        return test_action;
+    }
+
+    apply {
+        for (int i in [0, 1, 2, 3]) {
+            test_factory(i, (bit<32>) i)();
+        }
+    }
+}

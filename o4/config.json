@@ -1,0 +1,17 @@
+{
+  "output_file": "code/examples/o4_compilation_output.p4",
+  "run_p4_compiler": false,
+  "p4_compiler_executable": "/usr/local/bin/docker",
+  "p4_compiler_arguments": [
+    "compose",
+    "-f",
+    "code/docker-compose.yml",
+    "run",
+    "--rm",
+    "p4c",
+    "p4test",
+    "--pp",
+    "o4_pp_compilation_output.p4",
+    "o4_compilation_output.p4"
+  ]
+}

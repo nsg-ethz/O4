@@ -1,0 +1,383 @@
+#lang o4
+#include <core.p4>
+#include <tofino.p4>
+#include <tofino1arch.p4>
+
+header ethernet_h {
+    bit<48> dst_addr;
+    bit<48> src_addr;
+    bit<16> ether_type;
+}
+
+header ipv4_h {
+    bit<4>    version;
+    bit<4>    ihl;
+    bit<8>    diffserv;
+    bit<16>   len;
+    bit<16>   id;
+    bit<3>    flags;
+    bit<13>   frag_offset;
+    bit<8>    ttl;
+    bit<8>    proto;
+    bit<16>   hdr_checksum;
+    bit<32>   src_addr;
+    bit<8>[4] dst;
+}
+
+header transport_h {
+    bit<16> sport;
+    bit<16> dport;
+}
+
+header resubmit_h {
+    bit<16> cluster_id;
+}
+
+struct my_ingress_headers_t {
+    ethernet_h  ethernet;
+    ipv4_h      ipv4;
+    transport_h transport;
+}
+
+struct my_ingress_metadata_t {
+    bit<16>       cluster_id;
+    bit<32>[4][4] distances;
+    bit<32>       min_d1_d2;
+    bit<32>       min_d3_d4;
+    bit<32>       min_d1_d2_d3_d4;
+}
+
+parser MyIngressParser(packet_in pkt, out my_ingress_headers_t hdr, out my_ingress_metadata_t meta, out ingress_intrinsic_metadata_t ig_intr_md, out ingress_intrinsic_metadata_for_tm_t ig_tm_md) {
+    state start {
+        pkt.extract(ig_intr_md);
+        ig_tm_md.ucast_egress_port = 140;
+        meta.cluster_id = 0;
+        meta.distances = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+        meta.min_d1_d2 = 0;
+        meta.min_d3_d4 = 0;
+        meta.min_d1_d2_d3_d4 = 0;
+    }
+    state parse_port_metadata {
+        pkt.advance(PORT_METADATA_SIZE);
+    }
+    state parse_resubmit {
+        resubmit_h rh;
+        pkt.extract(rh);
+        meta.cluster_id = rh.cluster_id;
+        pkt.advance(PORT_METADATA_SIZE - 16);
+    }
+    state parse_ethernet {
+        pkt.extract(hdr.ethernet);
+    }
+    state parse_ipv4 {
+        pkt.extract(hdr.ipv4);
+    }
+    state parse_transport {
+        pkt.extract(hdr.transport);
+    }
+
+    start >(ig_intr_md.resubmit_flag)> { 0: parse_port_metadata; 1: parse_resubmit; } >> parse_ethernet;
+    parse_ethernet >(hdr.ethernet.ether_type)> { 0x800: parse_ipv4; default: accept; }
+    parse_ipv4 >(hdr.ipv4.frag_offset, hdr.ipv4.proto, hdr.ipv4.ihl)> { (0, 6, 5): parse_transport; (0, 17, 5): parse_transport; default: accept; }
+    parse_transport >> accept;
+}
+
+control MyIngress(inout my_ingress_headers_t hdr, inout my_ingress_metadata_t meta, in ingress_intrinsic_metadata_t ig_intr_md, in ingress_intrinsic_metadata_from_parser_t ig_prsr_md, inout ingress_intrinsic_metadata_for_deparser_t ig_dprsr_md, inout ingress_intrinsic_metadata_for_tm_t ig_tm_md) {
+    action send(PortId_t port) {
+        ig_tm_md.ucast_egress_port = port;
+    }
+    action set_qid(QueueId_t qid) {
+        ig_tm_md.qid = qid;
+    }
+    table cluster_to_prio {
+        key = {
+            meta.cluster_id: exact;
+        }
+        actions = {
+            set_qid;
+        }
+        default_action = set_qid(0);
+        size = 4;
+    }
+    Register<bit<32>, PortId_t>[4][4](512) register_min;
+    factory distance_min_f(Register<bit<32>, PortId_t> reg, bit<32> distance_field) {
+        RegisterAction<bit<32>, PortId_t, bit<32>>(reg) distance_min= {
+            void apply(inout bit<32> data, out bit<32> distance) {
+                distance = 0;
+                if (distance_field < data) {
+                    distance = data - distance_field;
+                }
+            }
+        };
+        return distance_min;
+    }
+    factory update_min_f(Register<bit<32>, PortId_t> reg, bit<32> update_field, int cluster_id) {
+        RegisterAction<bit<32>, PortId_t, bit<16>>(reg) update_min = {
+            void apply(inout bit<32> data) {
+                if (meta.cluster_id == cluster_id) {
+                    if (update_field < data) {
+                        data = update_field;
+                    }
+                }
+            }
+        };
+        return update_min;
+    }
+    Register<bit<32>, PortId_t>[4][4](512) register_max;
+    factory distance_max_f(Register<bit<32>, PortId_t> reg, bit<32> distance_field) {
+        RegisterAction<bit<32>, PortId_t, bit<32>>(reg) distance_max = {
+            void apply(inout bit<32> data, out bit<32> distance) {
+                distance = 0;
+                if (distance_field > data) {
+                    distance = distance_field - data;
+                }
+            }
+        };
+        return distance_max;
+    }
+    factory update_max_f(Register<bit<32>, PortId_t> reg, bit<32> update_field, int cluster_id) {
+        RegisterAction<bit<32>, PortId_t, bit<32>>(reg) update_max = {
+            void apply(inout bit<32> data) {
+                if (meta.cluster_id == cluster_id) {
+                    if (update_field > data) {
+                        data = update_field;
+                    }
+                }
+            }
+        };
+        return update_max;
+    }
+    factory compute_distance_min_f(int cluster, bit<32> distance_field, int value) {
+        action compute_distance_min(PortId_t port) {
+            meta.distances[cluster][value] = distance_min_f(register_min[cluster][value], distance_field).execute(port);
+        }
+        return compute_distance_min;
+    }
+    factory compute_distance_max_f(int cluster, bit<32> distance_field, int value) {
+        action compute_distance_max(PortId_t port) {
+            meta.distances[cluster][value] = distance_max_f(register_max[cluster][value], distance_field).execute(port);
+        }
+        return compute_distance_max;
+    }
+    factory tb_compute_distance_min_f(int cluster, bit<32> distance_field, int value) {
+        table tb_compute_distance_min {
+            key = {
+                ig_tm_md.ucast_egress_port: exact;
+            }
+            actions = {
+                compute_distance_min_f(cluster, distance_field, value);
+                @defaultonly NoAction;
+            }
+            const default_action = NoAction();
+            size = 512;
+        }
+        return tb_compute_distance_min;
+    }
+    factory tb_compute_distance_max_f(int cluster, bit<32> distance_field, int value) {
+        table tb_compute_distance_max {
+            key = {
+                ig_tm_md.ucast_egress_port: exact;
+            }
+            actions = {
+                compute_distance_max_f(cluster, distance_field, value);
+                @defaultonly NoAction;
+            }
+            const default_action = NoAction();
+            size = 512;
+        }
+        return tb_compute_distance_max;
+    }
+    factory merge_dst2_dport_dst3_to_sport_f(int value) {
+        action merge_dst2_dport_dst3_to_sport() {
+            for (int i in [0, 1, 2, 3]) {
+                meta.distances[i][0] += meta.distances[i][value];
+            }
+        }
+        return merge_dst2_dport_dst3_to_sport;
+    }
+    action compute_min_first() {
+        meta.min_d1_d2 = min(meta.distances[0][0], meta.distances[1][0]);
+        meta.min_d3_d4 = min(meta.distances[2][0], meta.distances[3][0]);
+    }
+    action compute_min_second() {
+        meta.min_d1_d2_d3_d4 = min(meta.min_d1_d2, meta.min_d3_d4);
+    }
+    factory do_update_min_f(int cluster, bit<32> update_field, int value) {
+        action do_update_min(PortId_t port) {
+            update_min_f(register_min[cluster][value], update_field, cluster).execute(port);
+        }
+        return do_update_min;
+    }
+    factory do_update_max_f(int cluster, bit<32> update_field, int value) {
+        action do_update_max(PortId_t port) {
+            update_max_f(register_max[cluster][value], update_field, cluster).execute(port);
+        }
+        return do_update_max;
+    }
+    factory tb_do_update_min_f(int cluster, bit<32> update_field, int value) {
+        table tb_do_update_min {
+            key = {
+                ig_tm_md.ucast_egress_port: exact;
+            }
+            actions = {
+                do_update_min_f(cluster, update_field, value);
+                @defaultonly NoAction;
+            }
+            const default_action = NoAction();
+            size = 512;
+        }
+        return tb_do_update_min;
+    }
+    factory tb_do_update_max_f(int cluster, bit<32> update_field, int value) {
+        table tb_do_update_max {
+            key = {
+                ig_tm_md.ucast_egress_port: exact;
+            }
+            actions = {
+                do_update_max_f(cluster, update_field, value);
+                @defaultonly NoAction;
+            }
+            const default_action = NoAction();
+            size = 512;
+        }
+        return tb_do_update_max;
+    }
+    apply {
+        if (hdr.ipv4.isValid()) {
+            if (ig_intr_md.resubmit_flag == 0) {
+                for (int cluster in [0, 1, 2, 3]) {
+                    tb_compute_distance_min_f(cluster, (bit<32>)hdr.transport.sport, 0).apply();
+                    if (meta.distances[cluster][0] == 0) {
+                        tb_compute_distance_max_f(cluster, (bit<32>)hdr.transport.sport, 0).apply();
+                    }
+                    tb_compute_distance_min_f(cluster, (bit<32>)hdr.ipv4.dst[2], 1).apply();
+                    if (meta.distances[cluster][1] == 0) {
+                        tb_compute_distance_max_f(cluster, (bit<32>)hdr.ipv4.dst[2], 1).apply();
+                    }
+                    tb_compute_distance_min_f(cluster, (bit<32>)hdr.transport.dport, 2).apply();
+                    if (meta.distances[cluster][2] == 0) {
+                        tb_compute_distance_max_f(cluster, (bit<32>)hdr.transport.dport, 2).apply();
+                    }
+                    tb_compute_distance_min_f(cluster, (bit<32>)hdr.ipv4.dst[3], 3).apply();
+                    if (meta.distances[cluster][3] == 0) {
+                        tb_compute_distance_max_f(cluster, (bit<32>)hdr.ipv4.dst[3], 3).apply();
+                    }
+                }
+                for (ing value in [1, 2, 3]) {
+                    merge_dst2_dport_dst3_to_sport_f(value)();
+                }
+                compute_min_first();
+                compute_min_second();
+                if (meta.min_d1_d2_d3_d4 == meta.distances[0][0]) {
+                    meta.cluster_id = 1;
+                } else if (meta.min_d1_d2_d3_d4 == meta.distances[1][0]) {
+                    meta.cluster_id = 2;
+                } else if (meta.min_d1_d2_d3_d4 == meta.distances[2][0]) {
+                    meta.cluster_id = 3;
+                } else if (meta.min_d1_d2_d3_d4 == meta.distances[3][0]) {
+                    meta.cluster_id = 4;
+                }
+                ig_dprsr_md.resubmit_type = 1;
+            } else {
+                for (int cluster in [0, 1, 2, 3]) {
+                    tb_do_update_min_f(cluster, (bit<32>)hdr.transport.sport, 0).apply();
+                    tb_do_update_min_f(cluster, (bit<32>)hdr.ipv4.dst[2], 1).apply();
+                    tb_do_update_min_f(cluster, (bit<32>)hdr.transport.dport, 2).apply();
+                    tb_do_update_min_f(cluster, (bit<32>)hdr.ipv4.dst[3], 3).apply();
+                    tb_do_update_max_f(cluster, (bit<32>)hdr.transport.sport, 0).apply();
+                    tb_do_update_max_f(cluster, (bit<32>)hdr.ipv4.dst[2], 1).apply();
+                    tb_do_update_max_f(cluster, (bit<32>)hdr.transport.dport, 2).apply();
+                    tb_do_update_max_f(cluster, (bit<32>)hdr.ipv4.dst[3], 3).apply();
+                }
+                cluster_to_prio.apply();
+            }
+        }
+    }
+}
+
+deparser MyIngressDeparser(packet_out pkt, inout my_ingress_headers_t hdr, in my_ingress_metadata_t meta, in ingress_intrinsic_metadata_for_deparser_t ig_dprsr_md) {
+    Resubmit() do_resubmit;
+    apply {
+        if (ig_dprsr_md.resubmit_type == 1) {
+            do_resubmit.emit<resubmit_h>({ meta.cluster_id });
+        }
+        pkt.emit(hdr);
+    }
+}
+
+struct my_egress_headers_t {
+    ethernet_h  ethernet;
+    ipv4_h      ipv4;
+    transport_h transport;
+}
+
+struct my_egress_metadata_t {
+}
+
+parser MyEgressParser(packet_in pkt, out my_egress_headers_t hdr, out my_egress_metadata_t meta, out egress_intrinsic_metadata_t eg_intr_md) {
+    state start {
+        pkt.extract(eg_intr_md);
+    }
+    state parse_ethernet {
+        pkt.extract(hdr.ethernet);
+    }
+    state parse_ipv4 {
+        pkt.extract(hdr.ipv4);
+    }
+    state parse_transport {
+        pkt.extract(hdr.transport);
+    }
+    start >> parse_ethernet >(hdr.ethernet.ether_type)> { 0x800: parse_ipv4; default: accept; }
+    parse_ipv4 >(hdr.ipv4.frag_offset, hdr.ipv4.proto, hdr.ipv4.ihl)> { (0, 6, 5): parse_transport; (0, 17, 5): parse_transport; default: accept; }
+    parse_transport >> accept;
+}
+
+control MyEgress(inout my_egress_headers_t hdr, inout my_egress_metadata_t meta, in egress_intrinsic_metadata_t eg_intr_md, in egress_intrinsic_metadata_from_parser_t eg_prsr_md, inout egress_intrinsic_metadata_for_deparser_t eg_dprsr_md, inout egress_intrinsic_metadata_for_output_port_t eg_dport_md) {
+    DirectCounter<bit<32>>(CounterType_t.PACKETS) packet_counter;
+    DirectCounter<bit<32>>(CounterType_t.BYTES) bytes_counter;
+    action packet_count() {
+        packet_counter.count();
+    }
+    action bytes_count() {
+        bytes_counter.count();
+    }
+    table do_packet_count {
+        key = {
+            eg_intr_md.egress_qid: exact @name("queue_id") ;
+        }
+        actions = {
+            packet_count;
+        }
+        counters = packet_counter;
+        default_action = packet_count();
+        size = 32;
+    }
+    table do_bytes_count {
+        key = {
+            eg_intr_md.egress_qid: exact @name("queue_id") ;
+        }
+        actions = {
+            bytes_count;
+        }
+        counters = bytes_counter;
+        default_action = bytes_count();
+        size = 32;
+    }
+    apply {
+        if (hdr.ipv4.isValid()) {
+            do_packet_count.apply();
+            do_bytes_count.apply();
+            hdr.ipv4.diffserv = (bit<8>)eg_intr_md.egress_qid;
+        }
+    }
+}
+
+deparser MyEgressDeparser(packet_out pkt, inout my_egress_headers_t hdr, in my_egress_metadata_t meta, in egress_intrinsic_metadata_for_deparser_t eg_dprsr_md) {
+    apply {
+        pkt.emit(hdr);
+    }
+}
+
+Pipeline(MyIngressParser(), MyIngress(), MyIngressDeparser(), MyEgressParser(), MyEgress(), MyEgressDeparser()) pipe;
+
+Switch(pipe) main;

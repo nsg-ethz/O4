@@ -1,0 +1,245 @@
+#lang o4
+#include <core.p4>
+#include <v1model.p4>
+
+const bit<16> TYPE_IPV4 = 0x800;
+const bit<8>[3] IP_PROTOCOLS = [6, 17, 0xfc];
+typedef bit<9> egressSpec_t;
+typedef bit<48> macAddr_t;
+typedef bit<32> ip4Addr_t;
+header ethernet_t {
+    macAddr_t dstAddr;
+    macAddr_t srcAddr;
+    bit<16>   etherType;
+}
+
+header loss_t {
+    bit<1> batch_id;
+    bit<7> padding;
+    bit<8> nextProtocol;
+}
+
+header ipv4_t {
+    bit<4>    version;
+    bit<4>    ihl;
+    bit<6>    dscp;
+    bit<2>    ecn;
+    bit<16>   totalLen;
+    bit<16>   identification;
+    bit<3>    flags;
+    bit<13>   fragOffset;
+    bit<8>    ttl;
+    bit<8>    protocol;
+    bit<16>   hdrChecksum;
+    ip4Addr_t srcAddr;
+    ip4Addr_t dstAddr;
+}
+
+header tcp_t {
+    bit<16>   srcPort;
+    bit<16>   dstPort;
+    bit<32>   seqNo;
+    bit<32>   ackNo;
+    bit<4>    dataOffset;
+    bit<4>    res;
+    bit<1>[8] flags;
+    bit<16>   window;
+    bit<16>   checksum;
+    bit<16>   urgentPtr;
+}
+
+header udp_t {
+    bit<16> srcPort;
+    bit<16> dstPort;
+    bit<16> length;
+    bit<16> checksum;
+}
+
+struct metadata {
+    bit<16>       tmp_src_port;
+    bit<16>       tmp_dst_port;
+    bit<16>[2][3] hash;
+    bit<64>[4]    tmp_field;
+    bit<16>[3]    batch_id;
+    bit<1>[2]     dont_execute;
+}
+
+struct headers {
+    ethernet_t ethernet;
+    ipv4_t     ipv4;
+    loss_t     loss;
+    tcp_t      tcp;
+    udp_t      udp;
+}
+
+parser MyParser(packet_in packet, out headers hdr, inout metadata meta, inout standard_metadata_t standard_metadata) {
+    state start {
+    }
+    state parse_ethernet {
+        packet.extract(hdr.ethernet);
+    }
+    state parse_ipv4 {
+        packet.extract(hdr.ipv4);
+    }
+    state parse_tcp {
+        packet.extract(hdr.tcp);
+    }
+    state parse_udp {
+        packet.extract(hdr.udp);
+    }
+    state parse_loss {
+        packet.extract(hdr.loss);
+    }
+    start >> parse_ethernet >(hdr.ethernet.etherType)> { TYPE_IPV4: parse_ipv4; default: accept; }
+    parse_ipv4 >(hdr.ipv4.protocol)> { IP_PROTOCOLS[0]: parse_tcp; IP_PROTOCOLS[1]: parse_udp; IP_PROTOCOLS[2]: parse_loss; default: accept; }
+    (parse_tcp, parse_udp) >> accept;
+    parse_loss >(hdr.loss.nextProtocol)> { IP_PROTOCOLS[0]: parse_tcp; IP_PROTOCOLS[1]: parse_udp; default: accept; }
+}
+
+deparser MyDeparser(packet_out packet, in headers hdr) {
+    apply {
+        packet.emit(hdr);
+    }
+}
+
+control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
+    apply {
+    }
+}
+
+control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadata_t standard_metadata) {
+    register<bit<16>>(1) last_batch_id;
+    register<bit<64>>[2][4](2048) loss_reg;
+    action drop() {
+        mark_to_drop(standard_metadata);
+    }
+    action compute_hash_indexes() {
+        for (int meter in [0, 1]) {
+            for (int index in [0, 1, 2]) {
+                hash(meta.hash[meter][index], HashAlgorithm.crc32_custom, meta.batch_id[meter] * 2048 / 2 + ((bit<16>)standard_metadata.egress_spec - 1) * 2048 / 2 / 2, { hdr.ipv4.srcAddr, hdr.ipv4.dstAddr, meta.tmp_src_port, meta.tmp_dst_port, hdr.loss.nextProtocol, hdr.ipv4.identification }, (bit<16>)2048 / 2 / 2);
+            }
+        }
+    }
+    factory apply_meter_f(int meter, int field_index, bit<64> field) {
+        action apply_meter() {
+            for (int index in [0, 1, 2]) {
+                loss_reg[meter][field_index].read(meta.tmp_field[field_index], (bit<32>)meta.hash[meter][index]);
+                meta.tmp_field[field_index] ^= field;
+                loss_reg[meter][field_index].write((bit<32>)meta.hash[meter][index], meta.tmp_field[field_index]);
+            }
+        }
+        return apply_meter;
+    }
+    factory apply_meter_counter_f(int meter) {
+        action apply_meter_counter() {
+            for (int index in [0, 1, 2]) {
+                loss_reg[meter][3].read(meta.tmp_field[3], (bit<32>)meta.hash[meter][index]);
+                meta.tmp_field[3] += 1;
+                loss_reg[meter][3].write((bit<32>)meta.hash[meter][index], meta.tmp_field[3]);
+            }
+        }
+        return apply_meter_counter;
+    }
+    action set_egress_port(bit<9> egress_port) {
+        standard_metadata.egress_spec = egress_port;
+    }
+    table forwarding {
+        key = {
+            standard_metadata.ingress_port: exact;
+        }
+        actions = {
+            set_egress_port;
+            drop;
+            NoAction;
+        }
+        size = 64;
+        default_action = drop;
+    }
+    action remove_header() {
+        bit<8> protocol = hdr.loss.nextProtocol;
+        hdr.loss.setInvalid();
+        hdr.ipv4.protocol = protocol;
+        hdr.ipv4.totalLen -= 2;
+        meta.dont_execute[0] = 1;
+    }
+    table remove_loss_header {
+        key = {
+            standard_metadata.egress_spec: exact;
+        }
+        actions = {
+            remove_header;
+            NoAction;
+        }
+        size = 64;
+        default_action = NoAction;
+    }
+    apply {
+        if (hdr.ipv4.isValid()) {
+            if (hdr.tcp.isValid()) {
+                meta.tmp_src_port = hdr.tcp.srcPort;
+                meta.tmp_dst_port = hdr.tcp.dstPort;
+            } else if (hdr.udp.isValid()) {
+                meta.tmp_src_port = hdr.udp.srcPort;
+                meta.tmp_dst_port = hdr.udp.dstPort;
+            }
+            forwarding.apply();
+            if (!hdr.loss.isValid()) {
+                hdr.loss.setValid();
+                hdr.loss.nextProtocol = hdr.ipv4.protocol;
+                hdr.ipv4.totalLen += 2;
+                hdr.ipv4.protocol = IP_PROTOCOLS[2];
+                meta.dont_execute[1] = 1;
+            } else {
+                meta.batch_id[1] = (bit<16>)hdr.loss.batch_id;
+            }
+            meta.batch_id[0] = (bit<16>)((standard_metadata.ingress_global_timestamp >> 21) % 2);
+            last_batch_id.read(meta.batch_id[2], (bit<32>)0);
+            last_batch_id.write((bit<32>)0, meta.batch_id[0]);
+            if (meta.batch_id[0] != meta.batch_id[2]) {
+                clone3(CloneType.I2E, 100, meta);
+            }
+            hdr.loss.batch_id = (bit<1>)meta.batch_id[0];
+            compute_hash_indexes();
+            remove_loss_header.apply();
+            if (meta.dont_execute[0] == 0) {
+                apply_meter_f(0, 0, (bit<64>)hdr.ipv4.srcAddr)();
+                apply_meter_f(0, 1, (bit<64>)hdr.ipv4.dstAddr)();
+                apply_meter_f(0, 2, (bit<8>)0 ++ meta.tmp_src_port ++ meta.tmp_dst_port ++ hdr.loss.nextProtocol ++ hdr.ipv4.identification)();
+                apply_meter_counter_f(0)();
+            }
+            if (meta.dont_execute[1] == 0) {
+                apply_meter_f(1, 0, (bit<64>)hdr.ipv4.srcAddr)();
+                apply_meter_f(1, 1, (bit<64>)hdr.ipv4.dstAddr)();
+                apply_meter_f(1, 2, (bit<8>)0 ++ meta.tmp_src_port ++ meta.tmp_dst_port ++ hdr.loss.nextProtocol ++ hdr.ipv4.identification)();
+                apply_meter_counter_f(1)();
+            }
+            if (hdr.ipv4.ttl == 1) {
+                drop();
+            } else {
+                hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+            }
+        }
+    }
+}
+
+control MyEgress(inout headers hdr, inout metadata meta, inout standard_metadata_t standard_metadata) {
+    apply {
+        if (standard_metadata.instance_type == 1) {
+            hdr.loss.setValid();
+            hdr.ipv4.setInvalid();
+            hdr.loss.batch_id = (bit<1>)meta.batch_id[2];
+            hdr.loss.padding = (bit<7>)0;
+            hdr.loss.nextProtocol = (bit<8>)0;
+            hdr.ethernet.etherType = 0x1234;
+            truncate((bit<32>)16);
+        }
+    }
+}
+
+control MyComputeChecksum(inout headers hdr, inout metadata meta) {
+    apply {
+        update_checksum(hdr.ipv4.isValid(), { hdr.ipv4.version, hdr.ipv4.ihl, hdr.ipv4.dscp, hdr.ipv4.ecn, hdr.ipv4.totalLen, hdr.ipv4.identification, hdr.ipv4.flags, hdr.ipv4.fragOffset, hdr.ipv4.ttl, hdr.ipv4.protocol, hdr.ipv4.srcAddr, hdr.ipv4.dstAddr }, hdr.ipv4.hdrChecksum, HashAlgorithm.csum16);
+    }
+}
+
+V1Switch(MyParser(), MyVerifyChecksum(), MyIngress(), MyEgress(), MyComputeChecksum(), MyDeparser()) main;

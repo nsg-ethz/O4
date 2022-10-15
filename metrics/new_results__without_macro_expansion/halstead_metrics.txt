@@ -1,0 +1,12 @@
+code/examples/tna/aes_oneround_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+Volume 16.92k, Difficulty 62.67, Effort 1.06M
+code/examples/tna/conquest_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+Volume 39.6k, Difficulty 116.51, Effort 4.61M
+code/examples/tna/ddos_aid_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+Volume 93.26k, Difficulty 157.18, Effort 14.66M
+code/examples/v1model/cm_sketch_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+Volume 5k, Difficulty 35.49, Effort 0.18M
+code/examples/v1model/heavy_hitter_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+Volume 7.02k, Difficulty 64.66, Effort 0.45M
+code/examples/v1model/loss_detection_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+Volume 25.38k, Difficulty 163.51, Effort 4.15M

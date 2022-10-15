@@ -1,0 +1,25 @@
+LOC:  127, LLOC:   78, %LOC:  7.1 for file ../examples/v1model/heavy_hitter_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+LOC:  113, LLOC:   68, %LOC:  7.1 for file ../examples/v1model/heavy_hitter.o4
+LOC: 11.0, LLOC: 12.8, %LOC:  0.1 percent reduction
+---
+LOC:  125, LLOC:   73, %LOC: 18.4 for file ../examples/v1model/cm_sketch_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+LOC:   89, LLOC:   49, %LOC:  4.5 for file ../examples/v1model/cm_sketch.o4
+LOC: 28.8, LLOC: 32.9, %LOC: 75.6 percent reduction
+---
+LOC:  300, LLOC:  228, %LOC: 32.3 for file ../examples/v1model/loss_detection_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+LOC:  181, LLOC:  127, %LOC: 12.7 for file ../examples/v1model/loss_detection.o4
+LOC: 39.7, LLOC: 44.3, %LOC: 60.7 percent reduction
+---
+LOC:  319, LLOC:  189, %LOC: 29.2 for file ../examples/tna/aes_oneround_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+LOC:  201, LLOC:  123, %LOC: 10.9 for file ../examples/tna/aes_oneround.o4
+LOC: 37.0, LLOC: 34.9, %LOC: 62.5 percent reduction
+---
+LOC:  647, LLOC:  566, %LOC: 52.7 for file ../examples/tna/conquest_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+LOC:  271, LLOC:  203, %LOC: 15.5 for file ../examples/tna/conquest.o4
+LOC: 58.1, LLOC: 64.1, %LOC: 70.6 percent reduction
+---
+LOC: 1354, LLOC: 1279, %LOC: 77.5 for file ../examples/tna/ddos_aid_normalized_wo_macro_exp__2022_09_22__19_50_33.p4
+LOC:  270, LLOC:  210, %LOC: 24.4 for file ../examples/tna/ddos_aid.o4
+LOC: 80.1, LLOC: 83.6, %LOC: 68.5 percent reduction
+---
+LOC: 42.4, LLOC: 45.4, %LOC: 56.3 percent average reduction
